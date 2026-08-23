@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Small, dependency-free CLI for a workspace metarepo."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+
+def run(args: list[str], cwd: Path | None = None, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, text=True, check=check,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def git(args: list[str], cwd: Path, check: bool = True) -> str:
+    p = run(["git", *args], cwd, check=check)
+    return (p.stdout or "").strip()
+
+
+def root() -> Path:
+    p = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if p.returncode:
+        fail("run ws inside a workspace metarepo")
+    return Path(p.stdout.strip()).resolve()
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"ws: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def scalar(value: str) -> str:
+    value = value.strip()
+    if value.startswith(('"', "'")):
+        try:
+            return json.loads(value) if value.startswith('"') else value[1:-1]
+        except (json.JSONDecodeError, IndexError):
+            pass
+    return value
+
+
+def load_manifest(path: Path) -> dict[str, dict[str, str]]:
+    """Parse the intentionally small repos.yaml schema without a YAML dependency."""
+    if not path.is_file():
+        fail(f"missing manifest: {path}")
+    repos: dict[str, dict[str, str]] = {}
+    in_repos = False
+    current: str | None = None
+    version = None
+    for number, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        text = line.strip()
+        if indent == 0 and text.startswith("version:"):
+            version = scalar(text.split(":", 1)[1])
+        elif indent == 0 and text == "repos:":
+            in_repos = True
+        elif in_repos and indent == 2 and text.endswith(":"):
+            current = text[:-1].strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", current):
+                fail(f"{path}:{number}: invalid repo name")
+            repos[current] = {}
+        elif in_repos and indent == 4 and current and ":" in text:
+            key, value = text.split(":", 1)
+            repos[current][key.strip()] = scalar(value)
+        else:
+            fail(f"{path}:{number}: unsupported manifest syntax")
+    if version != "1":
+        fail(f"{path}: version must be 1")
+    for name, spec in repos.items():
+        missing = {"path", "remote", "base"} - spec.keys()
+        if missing:
+            fail(f"{path}: {name} missing {', '.join(sorted(missing))}")
+        rel = Path(spec["path"])
+        if rel.is_absolute() or ".." in rel.parts or not str(rel).startswith("repos/"):
+            fail(f"{path}: {name} path must be a safe relative path under repos/")
+    return repos
+
+
+def workspace_name(meta: Path) -> str:
+    return os.environ.get("WORKTREE_NAME") or git(["branch", "--show-current"], meta) or meta.name
+
+
+def cache_dir(meta: Path) -> Path:
+    bare = os.environ.get("BARE_REPO_PATH")
+    if bare:
+        return Path(bare) / ".workspace-cache" / "repos"
+    common = Path(git(["rev-parse", "--git-common-dir"], meta)).resolve()
+    # In wtm, common dir is <project>/.git; keep cache outside Git internals and worktrees.
+    return common.parent / ".workspace-cache" / "repos"
+
+
+def ensure_cache(cache: Path, remote: str) -> None:
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if cache.exists():
+        run(["git", "-C", str(cache), "remote", "set-url", "origin", remote], check=False)
+        p = run(["git", "-C", str(cache), "fetch", "--prune", "origin"], check=False, capture=False)
+        if p.returncode:
+            print(f"warning: could not refresh cache {cache}; continuing with cached objects", file=sys.stderr)
+    else:
+        run(["git", "clone", "--mirror", remote, str(cache)], capture=False)
+
+
+def bootstrap(meta: Path) -> None:
+    manifest = load_manifest(meta / "repos.yaml")
+    cache_root = cache_dir(meta)
+    errors = []
+    for name, spec in manifest.items():
+        path = meta / spec["path"]
+        if (path / ".git").exists():
+            print(f"{name}: already present")
+            continue
+        if path.exists() and any(path.iterdir()):
+            errors.append(f"{name}: {path} exists and is not an empty Git repository")
+            continue
+        cache = cache_root / f"{name}.git"
+        try:
+            ensure_cache(cache, spec["remote"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            args = ["git", "clone", "--reference-if-able", str(cache), spec["remote"], str(path)]
+            run(args, capture=False)
+            run(["git", "-C", str(path), "checkout", spec["base"]], capture=False)
+            name_branch = workspace_name(meta)
+            if name_branch not in ("main", spec["base"]):
+                child_branch = "workspace/" + re.sub(r"[^A-Za-z0-9._/-]+", "-", name_branch).strip("-/")
+                if run(["git", "-C", str(path), "show-ref", "--verify", f"refs/heads/{child_branch}"], check=False).returncode:
+                    run(["git", "-C", str(path), "checkout", "-b", child_branch], capture=False)
+                else:
+                    run(["git", "-C", str(path), "checkout", child_branch], capture=False)
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"{name}: {exc}")
+    if errors:
+        fail("bootstrap incomplete:\n  " + "\n  ".join(errors))
+    artifacts = meta / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    goal = artifacts / "goal.md"
+    goal_template = meta / ".workspace" / "templates" / "goal.md"
+    if not goal.exists() and goal_template.exists():
+        goal.write_text(goal_template.read_text().replace("{{WORKSPACE}}", workspace_name(meta)))
+    print(f"workspace {workspace_name(meta)} is ready")
+
+
+def branch_summary(path: Path) -> tuple[str, str, str, str]:
+    branch = git(["branch", "--show-current"], path) or "(detached)"
+    head = git(["rev-parse", "--short=12", "HEAD"], path)
+    upstream = git(["rev-parse", "--abbrev-ref", "@{upstream}"], path, False)
+    delta = ""
+    if upstream:
+        counts = git(["rev-list", "--left-right", "--count", f"{upstream}...HEAD"], path, False).split()
+        if len(counts) == 2 and counts != ["0", "0"]:
+            delta = f" behind {counts[0]}, ahead {counts[1]}"
+    return branch, head, upstream, delta
+
+
+def status(meta: Path) -> None:
+    manifest = load_manifest(meta / "repos.yaml")
+    print(f"WORKSPACE  {workspace_name(meta)}\n")
+    branch, head, upstream, delta = branch_summary(meta)
+    print(f"META       {branch}  {head}{delta}")
+    changes = git(["status", "--short"], meta)
+    print(changes if changes else "  clean")
+    for name, spec in manifest.items():
+        path = meta / spec["path"]
+        print()
+        if not (path / ".git").exists():
+            print(f"{name.upper():10} MISSING ({spec['path']})")
+            continue
+        branch, head, upstream, delta = branch_summary(path)
+        print(f"{name.upper():10} {branch}  {head}{delta}")
+        changes = git(["status", "--short"], path)
+        print(changes if changes else "  clean")
+
+
+def remotely_represented(path: Path, sha: str) -> bool:
+    refs = git(["branch", "-r", "--contains", sha], path, False)
+    return bool(refs.strip())
+
+
+def archive(meta: Path) -> None:
+    manifest = load_manifest(meta / "repos.yaml")
+    blockers = []
+    for name, spec in manifest.items():
+        path = meta / spec["path"]
+        if not (path / ".git").exists():
+            blockers.append(f"{name}: missing repository at {spec['path']}")
+            continue
+        if git(["status", "--porcelain"], path):
+            blockers.append(f"{name}: uncommitted changes")
+        head = git(["rev-parse", "HEAD"], path)
+        if not remotely_represented(path, head):
+            blockers.append(f"{name}: HEAD {head[:12]} is not contained in any fetched remote branch")
+    if blockers:
+        print("workspace is NOT safely archived:", file=sys.stderr)
+        for item in blockers:
+            print(f"  - {item}", file=sys.stderr)
+        fail("commit/push child work as appropriate, then rerun ws archive")
+    git(["add", "artifacts"], meta)
+    staged = run(["git", "diff", "--cached", "--quiet"], meta, check=False)
+    if staged.returncode:
+        git(["commit", "-m", f"archive workspace {workspace_name(meta)}"], meta)
+    branch = git(["branch", "--show-current"], meta)
+    if not branch:
+        fail("cannot archive a detached metarepo HEAD")
+    run(["git", "push", "-u", "origin", branch], cwd=meta, capture=False)
+    print(f"workspace {workspace_name(meta)} safely archived and pushed")
+
+
+def update_base(meta: Path) -> None:
+    if git(["status", "--porcelain"], meta):
+        fail("metarepo is dirty; commit or stash before update-base")
+    if not git(["remote", "get-url", "base"], meta, False):
+        fail("missing base remote")
+    run(["git", "fetch", "base", "main"], cwd=meta, capture=False)
+    run(["git", "merge", "--no-edit", "base/main"], cwd=meta, capture=False)
+
+
+def doctor(meta: Path) -> None:
+    failures = 0
+    def check(ok: bool, text: str) -> None:
+        nonlocal failures
+        print(("OK   " if ok else "FAIL ") + text)
+        failures += 0 if ok else 1
+    for tool in ("git", "python3", "gh", "wtm", "jmux", "pi"):
+        check(shutil.which(tool) is not None, f"tool: {tool}")
+    try:
+        manifest = load_manifest(meta / "repos.yaml")
+        check(True, "repos.yaml schema")
+    except SystemExit:
+        manifest = {}
+        check(False, "repos.yaml schema")
+    check(bool(git(["remote", "get-url", "origin"], meta, False)), "metarepo origin remote")
+    check(bool(git(["remote", "get-url", "base"], meta, False)), "metarepo base remote")
+    check((meta / ".wtm" / "post_create").is_file(), ".wtm/post_create")
+    ignored = run(["git", "check-ignore", "-q", "repos/ws-doctor-probe"], meta, check=False)
+    check(ignored.returncode == 0, "outer metarepo ignores repos/*")
+    auth = run(["gh", "auth", "status"], check=False)
+    check(auth.returncode == 0, "GitHub CLI authentication")
+    common = git(["rev-parse", "--git-common-dir"], meta)
+    check(Path(common).name == ".git", "Git common directory detected")
+    for name, spec in manifest.items():
+        path = meta / spec["path"]
+        check((path / ".git").exists(), f"child repo: {name}")
+        if (path / ".git").exists():
+            health = run(["git", "fsck", "--no-dangling"], path, check=False)
+            check(health.returncode == 0, f"child Git health: {name}")
+    config = Path.home() / ".config" / "jmux" / "config.json"
+    try:
+        jmux = json.loads(config.read_text())
+        check(any(Path(p.get("dir", "")).expanduser().resolve() == Path(git(["rev-parse", "--git-common-dir"], meta)).resolve().parent
+                  for p in jmux.get("projects", [])), "jmux project registration")
+    except Exception:
+        check(False, "jmux project registration")
+    check("WORKTREE_DIR" in os.environ or (meta / ".wtm" / "post_create").exists(), "wtm hook integration detectable")
+    if failures:
+        fail(f"doctor found {failures} problem(s)")
+    print("doctor: healthy")
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print("usage: ws {bootstrap|status|archive|update-base|doctor}")
+        return
+    meta = root()
+    commands = {
+        "bootstrap": bootstrap, "status": status, "archive": archive,
+        "update-base": update_base, "doctor": doctor,
+    }
+    command = commands.get(sys.argv[1])
+    if not command:
+        fail(f"unknown command: {sys.argv[1]}")
+    command(meta)
+
+
+if __name__ == "__main__":
+    main()
