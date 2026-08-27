@@ -1,443 +1,175 @@
-# ws
+# ws — recursive workspace forking
 
-`ws` is a small, dependency-free CLI for Git-based, multi-repository development workspaces. It connects a shared workspace base, project-specific templates, task worktrees, independent child repositories, [wtm](https://github.com/jarredkenny/worktree-manager), and [jmux](https://github.com/jarredkenny/jmux).
+`ws` is a small, dependency-free CLI for creating, inheriting, updating, integrating,
+publishing, and removing **recursively nested development workspaces**. It implements
+[`workspace-forking-spec.md`](../workspace-forking-spec.md).
 
-The central idea is to separate **where work happens** from **what repositories are being changed**:
+The core abstraction:
 
-```text
-shared workspace base
-        ↓ ordinary Git ancestry and merges
-project workspace template (main)
-        ↓ wtm branch + worktree
-workspace instance
-        ↓ ws bootstrap reads repos.yaml
-independent repositories under repos/*
-```
+> A workspace is a filesystem node created by forking another workspace node.
 
-No Git submodules are used. The outer workspace repository tracks workspace structure and notes; application and tool changes are committed in their own repositories.
+A base template, project template, working instance, sample, and subtask are all the same
+kind of node — they differ only by policy and use. `ws` is local-first and needs no remote,
+and it does not depend on an editor, terminal multiplexer, or agent harness.
 
-## The four levels
-
-### 0. Shared base template
-
-A base repository contains infrastructure that every project workspace should inherit:
+## Node layout
 
 ```text
-workspace-base/
-├── AGENTS.md
-├── .claude/rules/          # shared rules, numbered 00–49
-├── .workspace/templates/
-│   └── goal.md
-├── .wtm/post_create
-├── artifacts/.gitkeep
-├── repos/.gitkeep
-├── .gitignore
-└── README.md
+workspace/
+├── .workspace/
+│   ├── node.json        # portable identity + immutable lineage (no absolute paths)
+│   ├── local.json        # machine-local owner, inheritance source, advancing baseline
+│   ├── hooks/            # inherited lifecycle hooks
+│   └── runtime/          # locks and transient state (git-ignored)
+├── artifacts/           # workspace-owned files (e.g. goal.md)
+├── repos/               # repository leaves — independent Git checkouts (git-ignored)
+├── children/            # nested child workspace nodes (git-ignored)
+├── workspace.yaml       # repository manifest (version 1)
+└── .gitignore
 ```
 
-The base knows nothing about a particular application. It owns conventions, shared agent guidance, the thin wtm hook, and workspace scaffolding.
+Each node's root may be its own outer Git repository tracking the workspace-owned files.
+Repository contents and child workspaces are always ignored by that outer repository.
 
-This installation uses [`abc-andrew/workspace-base`](https://github.com/abc-andrew/workspace-base) as the base template.
-
-`ws` itself is maintained in this standalone repository rather than vendored into the base. The base hook simply invokes the installed command:
+## Installing
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-exec ws bootstrap
-```
-
-### 1. Project workspace template
-
-Each logical project has a separate metarepo derived from the base. Its `main` branch is the golden template for all workspaces in that project.
-
-The project repository shares Git ancestry with the base and keeps two remotes:
-
-```text
-origin -> the project workspace repository
-base   -> the shared workspace-base repository
-```
-
-It adds project-owned files such as:
-
-```text
-repos.yaml
-PROJECT.md
-.claude/rules/50-project-architecture.md
-.claude/rules/55-project-development.md
-```
-
-This installation uses [`abc-andrew/toolkit-workspace`](https://github.com/abc-andrew/toolkit-workspace) as the project template. Its `main` branch inherits the shared base and currently defines two child repositories:
-
-```yaml
-version: 1
-
-repos:
-  toolkit:
-    path: repos/toolkit
-    remote: git@abc-andrew.github.com:abc-andrew/toolkit.git
-    base: main
-
-  ws:
-    path: repos/ws
-    remote: git@abc-andrew.github.com:abc-andrew/ws.git
-    base: main
-```
-
-The base remains reusable because these repository choices exist only in the Toolkit project template.
-
-### 2. Workspace instance
-
-A workspace instance is a branch and Git worktree of the project metarepo. It represents one task, investigation, or stream of work:
-
-```text
-toolkit-workspace/
-├── .git/              # wtm bare/control repository
-├── main/              # golden Toolkit template
-├── ws-tooling/        # workspace instance
-├── auth-redesign/     # another instance
-└── api-research/      # another instance
-```
-
-On creation, `ws bootstrap` initializes only:
-
-```text
-artifacts/
-└── goal.md
-```
-
-`goal.md` starts untracked so creating a workspace does not make an unsolicited commit. Commit it to the outer workspace branch when the goal is worth sharing.
-
-Workspace instances do not contain lock files and do not pin coordinated child SHAs. Recreating an instance clones the current base branches from `repos.yaml`. Exact cross-repository reconstruction can be added later if it becomes necessary.
-
-### 3. Independent child repositories
-
-Each entry in `repos.yaml` is cloned under `repos/` as a normal, independent Git repository:
-
-```text
-ws-tooling/
-├── artifacts/goal.md             # outer metarepo
-├── repos.yaml                    # outer metarepo
-└── repos/
-    ├── toolkit/                  # abc-andrew/toolkit Git repository
-    └── ws/                       # abc-andrew/ws Git repository
-```
-
-The outer `.gitignore` ignores `repos/*`, so the project metarepo never records child contents. There are no submodules or hidden Git links.
-
-Git ownership is explicit:
-
-- Workspace goals and notes are committed in the outer workspace branch.
-- Toolkit changes are committed and pushed from `repos/toolkit`.
-- `ws` changes are committed and pushed from `repos/ws`.
-- `ws status` must be used because outer `git status` cannot show child changes.
-
-## Installing ws
-
-`ws` requires Python 3 and Git. Install it from a stable clone before creating workspaces, because the wtm hook calls it during worktree creation:
-
-```bash
-git clone git@github.com:abc-andrew/ws.git ~/code/ws
+git clone <this-repo> ~/code/ws
 ln -s ~/code/ws/bin/ws ~/.local/bin/ws
 ws --help
 ```
 
-The stable installation is independent of any workspace instance. A workspace may contain `repos/ws` for developing the tool, but deleting that workspace must not remove the installed command.
+`bin/ws` is a thin launcher that resolves its own symlink and runs the `wsforge` package
+beside it, so the install is independent of any workspace instance. Requires Python 3.10+
+and Git.
 
-## Creating a project template from the shared base
-
-Create a new private project workspace repository on GitHub, then derive its local history from the base:
-
-```bash
-git clone git@github.com:abc-andrew/workspace-base.git my-project-workspace-seed
-cd my-project-workspace-seed
-
-git remote rename origin base
-git remote add origin git@github.com:OWNER/my-project-workspace.git
-
-# Add repos.yaml, PROJECT.md, and project rules numbered 50–89.
-git add .
-git commit -m "Configure project workspace"
-git push -u origin main
-```
-
-Convert the clean checkout to wtm's control-repository layout:
+## Quick start
 
 ```bash
-cd ..
-mv my-project-workspace-seed ~/workspaces/my-project-workspace
-cd ~/workspaces/my-project-workspace
-wtm init
+mkdir workspace-base && cd workspace-base
+ws init --protected                 # create a root node
+
+# declare repositories in workspace.yaml, then materialize local checkouts
+ws sync
+
+ws fork toolkit                     # fork a project template
+cd children/toolkit
+ws fork ws-tooling                  # fork a working instance
+cd children/ws-tooling
 ```
 
-The result is:
-
-```text
-~/workspaces/my-project-workspace/
-├── .git/       # bare/control Git data
-└── main/       # golden project template
-```
-
-Run `ws bootstrap` once in `main` if the golden worktree should have local child clones. Child contents remain ignored and are not pushed with the metarepo.
-
-## Adding repositories to a project
-
-Edit `repos.yaml` on the project template's `main` branch:
+`workspace.yaml`:
 
 ```yaml
 version: 1
 
-repos:
-  frontend:
-    path: repos/frontend
-    remote: git@github.com:OWNER/frontend.git
+repositories:
+  toolkit:
+    path: repos/toolkit
+    origin: git@host:owner/toolkit.git
     base: main
-
-  backend:
-    path: repos/backend
-    remote: git@github.com:OWNER/backend.git
+  ws:
+    path: repos/ws
+    origin: git@host:owner/ws.git
     base: main
 ```
 
-Then validate and publish the template change:
+## How forking works
+
+`ws fork NAME` is transactional. It verifies the parent is clean and structurally valid,
+materializes the child in a temporary sibling under `children/`, and only atomically renames
+it into place after every step and hook succeeds. Any failure removes the temporary child
+and leaves the parent untouched.
+
+- The outer workspace repository is locally cloned from the parent; its canonical `origin`
+  is retained (or set with `--origin`).
+- Each repository leaf is cloned from the parent's **local checkout** (committed state; no
+  unsafe Git alternates, no linked worktrees), its canonical `origin` is restored from
+  `workspace.yaml`, and a fresh branch `ws/<id>-<node>` is created from the parent's HEAD.
+- The child gets a new stable node id, immutable `created_from` provenance, and an
+  advancing baseline for future parent updates.
+
+Inheritance is **snapshot-based**: later parent changes never appear in a child
+automatically.
+
+## Inheritance and integration
 
 ```bash
-cd ~/workspaces/my-project-workspace/main
-ws bootstrap
-ws doctor
-git add repos.yaml PROJECT.md
-git commit -m "Add backend to workspace"
-git push origin main
+ws merge-parent      # merge the parent's current state into this child
+ws rebase-parent     # rebase this child's own commits onto the parent's current state
+ws integrate CHILD   # apply a child's changes upward into this parent
+ws integrate CHILD --repo toolkit   # integrate a single repository
 ```
 
-New workspace instances inherit the updated manifest. Existing instances can merge `main` and run `ws bootstrap` to add missing children.
+Workspace-owned files reconcile through the outer Git repository (a real three-way merge);
+repository leaves reconcile per repo by fetching directly from the local parent/child
+checkout. Conflicts are left visible for manual resolution, and a child never mutates its
+parent automatically. The advancing baseline only moves after a fully successful update.
 
-## Creating and using a workspace
-
-From the wtm control directory:
+## Lifecycle
 
 ```bash
-cd ~/workspaces/toolkit-workspace
-wtm create feature-name --from main --no-shell
-cd feature-name
+ws remove CHILD [--recursive] [--force]
+ws detach CHILD --to PATH [--copy] [--clear-source]
+ws reparent CHILD --to NEW_PARENT
 ```
 
-wtm creates the outer branch/worktree and runs the checked-in `.wtm/post_create`. That hook invokes:
+`remove` refuses to discard a subtree with dirty state, commits not represented on any
+remote, publication metadata, active locks, or descendants (without `--recursive`);
+`--force` enumerates what it discards. `detach` moves a subtree to an independent location,
+clears its owner, preserves provenance, and verifies every Git object store still validates.
+
+## Inspection
 
 ```bash
-ws bootstrap
+ws root            # active workspace root and id
+ws parent          # current owner and inheritance source
+ws context         # agent-oriented summary (repos, children, dirty, pending updates, goal)
+ws tree            # recursive structure, crossing ignored boundaries
+ws status [--tree] # nearest workspace, or the whole subtree
+ws doctor          # validate metadata, ids, containment, manifests, git health, ignores…
 ```
 
-Bootstrap then:
+Most commands accept `--json` for machine-readable output.
 
-1. reads `repos.yaml`;
-2. refreshes local bare mirror caches for efficient clones;
-3. clones each missing child repository;
-4. checks out its configured base branch;
-5. creates a local `workspace/<instance-name>` child branch for task workspaces; and
-6. creates `artifacts/goal.md` without overwriting an existing goal.
-
-Inspect the complete workspace with:
+## Publication
 
 ```bash
-ws status
+ws publish [--tree] [--push] [--bundle]
+ws materialize REFERENCE [--into PATH]
 ```
 
-Example shape:
+Local forking, updating, and integration never require publication. `publish` verifies a
+node (or `--tree` subtree) is committed and remotely represented, then writes a portable
+descriptor (`.workspace/portable.json`) with no absolute paths. It never pushes unless
+`--push` is given, and prints the exact remotes and refs first. `materialize` reconstructs a
+portable subtree, verifying every referenced commit rather than substituting a default
+branch.
 
-```text
-WORKSPACE  ws-tooling
+## Hooks
 
-META       ws-tooling  ac86a74b0af9
-?? artifacts/goal.md
+Inherited executables under `.workspace/hooks/` run around operations: `pre-fork`,
+`post-fork`, `pre/post-merge-parent`, `pre/post-rebase-parent`, `pre/post-integrate`,
+`pre-remove`, `pre/post-detach`, `pre/post-publish`. They receive `WS_OPERATION`,
+`WS_PARENT_ROOT`, `WS_CHILD_ROOT`, `WS_PARENT_ID`, `WS_CHILD_ID`, and `WS_FORK_BASELINE`.
+Hooks are trusted local code; `--no-hooks` skips optional hooks but never core identity, Git
+safety, baseline, or lifecycle invariants.
 
-TOOLKIT    workspace/ws-tooling  a0a8bdde5cd7
-  clean
+## Security
 
-WS         workspace/ws-tooling  18ba3189c5b4
-  clean
-```
-
-## Repository workflow
-
-Work in each repository according to ownership:
-
-```bash
-# Application change
-cd repos/toolkit
-git add ...
-git commit -m "Implement feature"
-git push -u origin workspace/feature-name
-
-# Workspace CLI change
-cd ../ws
-git add ...
-git commit -m "Improve workspace status"
-git push -u origin workspace/feature-name
-
-# Workspace goal or notes
-cd ../..
-git add artifacts/goal.md
-git commit -m "Document workspace goal"
-```
-
-Open and merge pull requests in each child repository independently. The outer workspace branch does not replace those repository workflows.
-
-Before archiving, `ws archive` checks every child repository for:
-
-- uncommitted work; and
-- a HEAD commit not represented by any fetched remote branch.
-
-It never pushes child repositories automatically. Once child work is safe, it commits outer artifacts and pushes the workspace branch:
-
-```bash
-ws archive
-```
-
-## Sharing the base template
-
-Publish `workspace-base/main` and grant projects read access. Project metarepos consume updates through ordinary Git:
-
-```bash
-cd ~/workspaces/toolkit-workspace/main
-ws update-base
-git push origin main
-```
-
-`ws update-base` performs the equivalent of:
-
-```bash
-git fetch base main
-git merge base/main
-```
-
-Keep base-owned files stable and make project customization additive to minimize merge conflicts. Shared Claude rules use numbers 00–49; project rules use 50–89.
-
-Multiple project templates can share the same base history:
-
-```text
-workspace-base/main
-├── toolkit-workspace/main
-├── commerce-workspace/main
-└── platform-workspace/main
-```
-
-Each project chooses its own `repos.yaml` without teaching the base about application repositories.
-
-## Sharing project templates
-
-The project metarepo's `main` branch is the shared golden template. Team members clone/adopt that repository with wtm, then create their own workspace branches from `main`.
-
-Changes that should affect every future instance belong on project `main`, for example:
-
-- repository membership in `repos.yaml`;
-- project architecture documentation;
-- project-level agent rules; and
-- shared workspace conventions specific to that project.
-
-Task goals and temporary investigation notes should stay on workspace-instance branches rather than modifying the golden template.
-
-## Sharing workspace instances for reference
-
-A workspace instance can be shared by committing its outer artifacts and pushing its outer branch:
-
-```bash
-git add artifacts/goal.md
-git commit -m "Document ws tooling workspace"
-git push -u origin ws-tooling
-```
-
-Another person can materialize the outer branch from the wtm control directory:
-
-```bash
-wtm checkout ws-tooling
-```
-
-wtm checks out the branch and runs `.wtm/post_create`; `ws bootstrap` then populates child repositories from the current bases in `repos.yaml`.
-
-This shares the workspace's goal, notes, metarepo history, and repository composition. It does **not** pin child commits. For reference, include child pull-request URLs or branch names in workspace notes when they matter.
-
-## How wtm fits
-
-[wtm](https://github.com/jarredkenny/worktree-manager) manages one project metarepo as a bare/control repository with sibling worktrees:
-
-```text
-wtm project/control directory
-├── .git/
-├── main/
-├── task-a/
-└── task-b/
-```
-
-Useful commands:
-
-```bash
-wtm create task-a --from main --no-shell  # new branch and worktree
-wtm list                                  # list project worktrees
-wtm checkout existing-branch              # materialize a pushed workspace branch
-wtm delete task-a --force                  # remove a local worktree
-```
-
-The checked-in `.wtm/post_create` is the integration point. Its version comes from the branch used to create or check out the worktree, and it delegates setup to the installed `ws` command.
-
-## How jmux fits
-
-[jmux](https://github.com/jarredkenny/jmux) treats the wtm control directory as a project and its worktrees as sessions/workspaces.
-
-For Toolkit, the conceptual view is:
-
-```text
-Toolkit Workspace
-├── main
-├── ws-tooling
-├── auth-redesign
-└── api-research
-```
-
-Configure a jmux project with the wtm control directory and enable wtm integration:
-
-```json
-{
-  "projects": [
-    {
-      "id": "toolkit",
-      "title": "Toolkit Workspace",
-      "dir": "/Users/andrewnicholson/workspaces/toolkit-workspace",
-      "settings": {
-        "defaultBaseBranch": "main",
-        "wtmIntegration": true,
-        "autoLaunchAgent": true,
-        "agentCommand": "pi"
-      }
-    }
-  ]
-}
-```
-
-In jmux, `Ctrl-a n` → select the project → create a worktree runs the same underlying operation as:
-
-```bash
-wtm create NAME --from main --no-shell
-```
-
-The wtm hook runs `ws bootstrap`, after which jmux opens the resulting worktree and can launch the configured agent. jmux manages terminal sessions and visibility; wtm manages outer Git worktrees; `ws` populates and inspects the independent child repositories.
-
-## Commands
-
-```text
-ws bootstrap    clone missing repositories from repos.yaml and create artifacts/goal.md
-ws status       aggregate outer and child branch, SHA, dirty, and ahead/behind state
-ws archive      verify child safety, commit outer artifacts, and push the workspace branch
-ws update-base  fetch and merge base/main into the project metarepo
-ws doctor       validate tools, remotes, manifest, ignores, child Git, GitHub, wtm, and jmux
-```
+The workspace tree provides contextual scope, **not** security isolation. A process can
+still reach `..`, absolute paths, and other files. Combine `ws` with an external sandbox for
+security-sensitive use. Hooks are executable code; secrets and machine-specific credentials
+are never inherited, committed, or published by default.
 
 ## Development
 
-`bin/ws` is the canonical CLI source. Keep it dependency-free and conservative around Git state.
-
 ```bash
-python3 -m py_compile bin/ws
+python3 -m py_compile bin/ws wsforge/*.py
+python3 -m pytest
 ```
 
-Toolkit Workspace includes this repository at `repos/ws`, so the tool can be developed alongside Toolkit without conflating their Git histories.
+`wsforge/` is the CLI implementation; keep it dependency-free (Python stdlib + `git`).
+`ws sync` is the one command beyond the spec's §24 set: it materializes declared repository
+leaves from their `origin`, which a root needs because fork and parent-update clone from a
+*local* parent checkout.
